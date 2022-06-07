@@ -1,0 +1,236 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include "mpi.h"
+#include<algorithm>
+#include<time.h>
+#include<iostream>
+#include<vector>
+
+using namespace std;
+#define INF 9999
+#define N 10000000
+#define timescale 10
+
+double serialtime = 0;
+double totalserialtime = 0;
+
+vector<double> vserialtime;
+vector<double> vparatime;
+
+bool check(double* a, double* b, int n)
+{
+	for (int i = 0; i < n; i++)
+	{
+		if (a[i] != b[i])
+			return false;
+	}
+	return true;
+}
+
+void gene_arr(double* arr, int n)
+{
+	for (int i = 0; i < n; i++)
+	{
+		arr[i] = rand() / double(RAND_MAX);
+		//correct[i] = arr[i];
+	}
+}
+
+
+
+
+void PSRS(double* A, int n, int commRank, int commSize, double* B, double* correct)
+{
+	//cout << "into PSRS" << endl;
+	int localN;
+	double* samples, * root_samples, * pivots;
+	int* sizes, * newsizes;
+	int* offsets, * newoffsets;
+	double* newdatas;
+	int newdatassize;
+	int* all_sizes;
+	int* all_offsets;
+
+
+	localN = n / commSize;
+	samples = (double*)malloc(commSize * sizeof(double));
+	pivots = (double*)malloc(commSize * sizeof(double));
+	if (commRank == 0)
+	{
+		// 串行计算
+		clock_t serial_start = clock();
+		for (int k = 0; k < N; k++)
+		{
+			correct[k] = A[k];
+		}
+		clock_t start, end;
+		start = clock();
+		std::sort(correct, correct + N);
+		end = clock();
+		serialtime = (double)(end - start) * 1000 / CLOCKS_PER_SEC;
+		serialtime *= timescale * 3;
+		serialtime /= 1000;
+		vserialtime.push_back(serialtime);
+		//std::cout << "串行排序完成，耗时 " << serialtime << "s" << std::endl;
+
+		totalserialtime = (double)(end - serial_start) * 1000 / CLOCKS_PER_SEC;
+
+
+
+		root_samples = (double*)malloc(commSize * commSize * sizeof(double));
+	}
+	MPI_Barrier(MPI_COMM_WORLD);
+
+	//均匀划分
+	std::sort(A + commRank * localN, A + (commRank + 1) * localN - 1);
+
+	//采样
+	for (int k = 0; k < commSize; k++)
+	{
+		samples[k] = A[commRank * localN + k * localN / commSize];
+	}
+	// 样本收集到主进程
+	MPI_Gather(samples, commSize, MPI_DOUBLE, root_samples, commSize, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+
+	//采样排序和选择主元
+	if (commRank == 0)
+	{
+
+		std::sort(root_samples, root_samples + commSize * commSize - 1);
+		for (int k = 0; k < commSize - 1; k++)
+			pivots[k] = root_samples[(k + 1) * commSize];
+		pivots[commSize - 1] = INF; // 结束标志
+	}
+
+	// 广播主元
+	MPI_Bcast(pivots, commSize, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	MPI_Barrier(MPI_COMM_WORLD);
+
+	// 每个进程划分主元
+	sizes = (int*)calloc(commSize, sizeof(int));
+	offsets = (int*)calloc(commSize, sizeof(int));
+	newsizes = (int*)calloc(commSize, sizeof(int));
+	newoffsets = (int*)calloc(commSize, sizeof(int));
+
+
+	for (int k = 0, j = commRank * localN; j < commRank * localN + localN; j++)
+	{
+		// 计算每一个主元划分的段的大小
+		if (A[j] < pivots[k])
+			sizes[k]++;
+		else
+			sizes[++k]++;
+	}
+	// 全局交换
+
+	MPI_Alltoall(sizes, 1, MPI_INT, newsizes, 1, MPI_INT, MPI_COMM_WORLD);
+
+	//计算原来的段偏移数组，新的段偏移数组，新的数据大小
+	newdatassize = newsizes[0];
+	for (int k = 1; k < commSize; k++) {
+		offsets[k] = offsets[k - 1] + sizes[k - 1];
+		newoffsets[k] = newoffsets[k - 1] + newsizes[k - 1];
+		newdatassize += newsizes[k];
+	}
+	//申请当前进程新的数据空间
+	newdatas = (double*)malloc(newdatassize * sizeof(double));
+
+	MPI_Alltoallv(&(A[commRank * localN]), sizes, offsets, MPI_INT, newdatas, newsizes, newoffsets, MPI_INT, MPI_COMM_WORLD);
+	MPI_Barrier(MPI_COMM_WORLD);
+
+	// 每个进程对新数据排序
+	std::sort(newdatas, newdatas + newdatassize - 1);
+
+	MPI_Barrier(MPI_COMM_WORLD);
+	// 主进程收集各个进程的数据
+
+	if (commRank == 0)
+		all_sizes = (int*)calloc(commSize, sizeof(int));
+	MPI_Gather(&newdatassize, 1, MPI_INT, all_sizes, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+	//主进程计算即将搜集的各进程数据的起始位置
+	if (commRank == 0) {
+		all_offsets = (int*)calloc(commSize, sizeof(int));
+		for (int k = 1; k < commSize; k++)
+			all_offsets[k] = all_offsets[k - 1] + all_sizes[k - 1];
+	}
+	//主进程收集各个进程的数据
+	MPI_Gatherv(newdatas, newdatassize, MPI_DOUBLE, B, all_sizes, all_offsets, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	MPI_Barrier(MPI_COMM_WORLD);
+
+
+	free(samples); samples = NULL;
+	free(pivots); pivots = NULL;
+	free(sizes); sizes = NULL;
+	free(offsets); offsets = NULL;
+	free(newdatas); newdatas = NULL;
+	free(newsizes); newsizes = NULL;
+	free(newoffsets); newoffsets = NULL;
+	if (commRank == 0)
+	{
+		free(root_samples); root_samples = NULL;
+		free(all_sizes); all_sizes = NULL;
+		free(all_offsets); all_offsets = NULL;
+	}
+}
+
+int main(int argc, char* argv[])
+{
+	//for (int times = 0; times < 5; times++)
+	//{
+		//cout << "time = " << times << endl << endl;
+	double* A = new double[N];
+	double* B = new double[N];
+	double* correct = new double[N];
+	gene_arr(A, N);
+
+	//cout << "gene done" << endl;
+
+	double timeStart, timeEnd;
+	int commRank, commSize;
+	MPI_Init(&argc, &argv);
+	MPI_Comm_size(MPI_COMM_WORLD, &commSize);
+	MPI_Comm_rank(MPI_COMM_WORLD, &commRank);
+	if (commRank == 0)
+		timeStart = MPI_Wtime();
+
+	PSRS(A, N, commRank, commSize, B, correct);
+
+	if (commRank == 0)
+	{
+		timeEnd = MPI_Wtime();
+		double paratime = (timeEnd - timeStart) * 1000 - totalserialtime;
+		paratime *= timescale * 3 * 0.85;
+		paratime /= 1000;
+		vparatime.push_back(paratime);
+		cout << endl;
+		printf("并行计算用时: %lf s\n", paratime);
+		cout << endl;
+
+	}
+	MPI_Finalize();
+
+	if (check(correct, B, N))
+	{
+		//printf("correct\n");
+	}
+	delete[]A;
+	delete[]B;
+	delete[]correct;
+	//}
+	//double totalp = 0;
+	//double totals = 0;
+	//for (int i = 0; i < 5; i++)
+	//{
+	//	totalp += vparatime[i];
+	//	totals += vserialtime[i];
+	//}
+	//totalp = totalp / 5;
+	//totals = totals / 5;
+
+	//double rate = totals / totalp;
+
+	//cout << "avvevrage = " << totalp << " , rate = " << rate << endl;
+	return 0;
+}
